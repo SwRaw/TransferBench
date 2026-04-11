@@ -1,27 +1,51 @@
 #
-# Copyright (c) 2019-2025 Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 #
 
 # Configuration options
 ROCM_PATH ?= /opt/rocm
 CUDA_PATH ?= /usr/local/cuda
+MPI_PATH  ?= /usr/local/openmpi
+
+# Optional features (set to 0 to disable, 1 to enable)
+# DISABLE_NIC_EXEC: Disable RDMA/NIC executor support (default: 0)
+# DISABLE_MPI_COMM: Disable MPI communicator support (default: 0)
+# DISABLE_DMABUF: Disable DMA-BUF support for GPU Direct RDMA (default: 1)
 
 HIPCC ?= $(ROCM_PATH)/bin/amdclang++
 NVCC ?= $(CUDA_PATH)/bin/nvcc
+
+# ROCm device libraries can live in different locations depending on packaging.
+# hipcc/clang needs to find the amdgcn bitcode directory at link time.
+ROCM_DEVICE_LIB_PATH ?=
+ifneq ($(wildcard $(ROCM_PATH)/amdgcn/bitcode),)
+  ROCM_DEVICE_LIB_PATH := $(ROCM_PATH)/amdgcn/bitcode
+else ifneq ($(wildcard $(ROCM_PATH)/lib/llvm/amdgcn/bitcode),)
+  ROCM_DEVICE_LIB_PATH := $(ROCM_PATH)/lib/llvm/amdgcn/bitcode
+endif
+
+# Option to compile with single GFX kernel to drop compilation time
+SINGLE_KERNEL ?= 0
 
 # This can be a space separated string of multiple GPU targets
 # Default is the native GPU target
 GPU_TARGETS ?= native
 
+EXE=TransferBench
 DEBUG ?= 0
 
+# Only perform this check if 'make clean' is not the target
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
-  # Compile TransferBenchCuda if nvidia-smi returns successfully and nvcc detected
-  ifeq ("$(shell nvidia-smi > /dev/null 2>&1 && test -e $(NVCC) && echo found)", "found")
-    EXE=TransferBenchCuda
-    CXX=$(NVCC)
+  ifeq ($(MAKECMDGOALS),TransferBenchCuda)
+    # Check for nvcc
+    ifneq ($(shell test -e $(NVCC) && echo found), found)
+      $(error "Could not find $(NVCC).  Please set CUDA_PATH appropriately")
+    else
+      $(info Compiling TransferBenchCuda using $(NVCC))
+    endif
+    NVFLAGS = -x cu -lnuma -arch=native
   else
-    EXE=TransferBench
+    # Check for HIP compiler
     ifeq ("$(shell test -e $(HIPCC) && echo found)", "found")
       CXX=$(HIPCC)
     else ifeq ("$(shell test -e $(ROCM_PATH)/bin/hipcc && echo found)", "found")
@@ -31,12 +55,18 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
       $(error "Could not find $(HIPCC) or $(ROCM_PATH)/bin/hipcc. Check if the path is correct if you want to build $(EXE)")
     endif
     GPU_TARGETS_FLAGS = $(foreach target,$(GPU_TARGETS),"--offload-arch=$(target)")
+
+    CXXFLAGS = -I$(ROCM_PATH)/include -I$(ROCM_PATH)/include/hip -I$(ROCM_PATH)/include/hsa
+    HIPLDFLAGS= -lnuma -L$(ROCM_PATH)/lib -lhsa-runtime64 -lamdhip64
+    HIPFLAGS = -Wall -x hip -D__HIP_PLATFORM_AMD__ -D__HIPCC__ $(GPU_TARGETS_FLAGS)
+    ifneq ($(strip $(ROCM_DEVICE_LIB_PATH)),)
+      HIPFLAGS += --rocm-device-lib-path=$(ROCM_DEVICE_LIB_PATH)
+    endif
   endif
 
-  CXXFLAGS = -I$(ROCM_PATH)/include -I$(ROCM_PATH)/include/hip -I$(ROCM_PATH)/include/hsa
-  HIPLDFLAGS= -lnuma -L$(ROCM_PATH)/lib -lhsa-runtime64 -lamdhip64
-  HIPFLAGS = -x hip -D__HIP_PLATFORM_AMD__ -D__HIPCC__ $(GPU_TARGETS_FLAGS)
-  NVFLAGS  = -x cu -lnuma -arch=native
+  ifeq ($(SINGLE_KERNEL), 1)
+    COMMON_FLAGS += -DSINGLE_KERNEL
+  endif
 
   ifeq ($(DEBUG), 0)
     COMMON_FLAGS += -O3
@@ -59,9 +89,30 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
     else ifeq ("$(shell echo '#include <infiniband/verbs.h>' | $(CXX) -E - 2>/dev/null | grep -c 'infiniband/verbs.h')", "0")
       $(info infiniband/verbs.h not found)
     else
-      CXXFLAGS += -DNIC_EXEC_ENABLED
+      COMMON_FLAGS += -DNIC_EXEC_ENABLED
       LDFLAGS += -libverbs
       NIC_ENABLED = 1
+
+      # Disable DMA-BUF support by default (set DISABLE_DMABUF=0 to enable)
+      DISABLE_DMABUF ?= 1
+      ifeq ($(DISABLE_DMABUF), 0)
+        # Check for both ibv_reg_dmabuf_mr and ROCm DMA-BUF export support
+        HAVE_IBV_DMABUF := $(shell echo '#include <infiniband/verbs.h>' | $(CXX) -E - 2>/dev/null | grep -c 'ibv_reg_dmabuf_mr')
+        HAVE_ROCM_DMABUF := $(shell echo '#include <hsa/hsa_ext_amd.h>' | $(CXX) -I$(ROCM_PATH)/include -E - 2>/dev/null | grep -c 'hsa_amd_portable_export_dmabuf')
+
+        ifeq ($(HAVE_IBV_DMABUF):$(HAVE_ROCM_DMABUF), 0:0)
+          $(info Building without DMA-BUF support: missing both ibv_reg_dmabuf_mr and ROCm DMA-BUF export)
+        else ifeq ($(HAVE_IBV_DMABUF), 0)
+          $(info Building without DMA-BUF support: missing ibv_reg_dmabuf_mr)
+        else ifeq ($(HAVE_ROCM_DMABUF), 0)
+          $(info Building without DMA-BUF support: missing ROCm DMA-BUF export)
+        else
+          COMMON_FLAGS += -DHAVE_DMABUF_SUPPORT
+          $(info Building with DMA-BUF support)
+        endif
+      else
+        $(info Building with DMA-BUF support disabled (DISABLE_DMABUF=1))
+      endif
     endif
     ifeq ($(NIC_ENABLED), 0)
       $(info Building without NIC executor support)
@@ -70,14 +121,40 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
       $(info Building with NIC executor support. Can set DISABLE_NIC_EXEC=1 to disable)
     endif
   endif
+
+  MPI_ENABLED = 0
+  # Compile with MPI communicator support if
+  # 1) DISABLE_MPI_COMM is not set to 1
+  # 2) mpi.h is found in the MPI_PATH
+  DISABLE_MPI_COMM ?= 0
+  ifneq ($(DISABLE_MPI_COMM), 1)
+    ifeq ($(wildcard $(MPI_PATH)/include/mpi.h),)
+      $(info Unable to find mpi.h at $(MPI_PATH)/include.  Please specify appropriate MPI_PATH)
+    else
+      MPI_ENABLED = 1
+      COMMON_FLAGS += -DMPI_COMM_ENABLED -I$(MPI_PATH)/include
+      LDFLAGS += -L/$(MPI_PATH)/lib -lmpi
+      ifeq ($(DEBUG), 1)
+        LDFLAGS += -lmpi_cxx
+      endif
+    endif
+
+    ifeq ($(MPI_ENABLED), 0)
+      $(info Building without MPI communicator support)
+      $(info To use TransferBench with MPI support, install MPI libraries and specify appropriate MPI_PATH)
+    else
+      $(info Building with MPI communicator support.  Can set DISABLE_MPI_COMM=1 to disable)
+   endif
+  endif
 endif
+
 
 .PHONY : all clean
 
 all: $(EXE)
 
 TransferBench: ./src/client/Client.cpp $(shell find -regex ".*\.\hpp")
-	$(HIPCC) $(CXXFLAGS) $(HIPFLAGS) $(COMMON_FLAGS) $< -o $@ $(HIPLDFLAGS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(HIPFLAGS) $(COMMON_FLAGS) $< -o $@ $(HIPLDFLAGS) $(LDFLAGS)
 
 TransferBenchCuda: ./src/client/Client.cpp $(shell find -regex ".*\.\hpp")
 	$(NVCC) $(NVFLAGS) $(COMMON_FLAGS) $< -o $@ $(LDFLAGS)
